@@ -1,0 +1,100 @@
+# Общее для всех сервисов приложения: каждый умеет собрать образ сам,
+# поэтому `docker compose up consumer` работает и без заранее собранного образа
+x-app: &app
+  build: .
+  image: async-payment-processor
+  environment:
+    DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+    RABBITMQ_URL: amqp://payments:payments@rabbitmq:5672/
+    API_KEY: ${API_KEY:-dev-api-key}
+  env_file:
+    - path: .env
+      required: false
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: payments
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "payments", "-d", "payments"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  rabbitmq:
+    image: rabbitmq:4.4-management
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: payments
+      RABBITMQ_DEFAULT_PASS: payments
+    ports:
+      - "${RABBITMQ_UI_PORT:-15672}:15672"
+    healthcheck:
+      # Интервал не короче 5 с: ранняя проба на первом запуске роняет узел
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["uvicorn", "app.api.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${API_PORT:-8000}:8000"
+    restart: unless-stopped
+    # От RabbitMQ не зависит: платежи принимаются и при остановленном брокере
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+
+  outbox-relay:
+    <<: *app
+    command: ["python", "-m", "app.outbox"]
+    # Запас сверх стандартных 10 с Docker: текущая пачка outbox успевает
+    # опубликоваться и закоммитить отметки до SIGKILL
+    stop_grace_period: 30s
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  consumer:
+    <<: *app
+    command: ["faststream", "run", "app.consumer.app:create_app", "--factory"]
+    # Обработчик законно работает до ~10 с (5 с шлюз + 5 с webhook) —
+    # ровно стандартный таймаут остановки Docker
+    stop_grace_period: 30s
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  webhook-mock:
+    <<: *app
+    command: ["uvicorn", "devtools.webhook_mock:app", "--host", "0.0.0.0", "--port", "8080"]
+
+volumes:
+  postgres-data:
