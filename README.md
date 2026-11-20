@@ -12,6 +12,27 @@ HTTP API принимает платёж и сразу отвечает `202 Acc
 Стек: FastAPI, Pydantic v2, SQLAlchemy 2.0 (async), PostgreSQL 17, RabbitMQ 4.4
 через FastStream, Alembic, Docker Compose.
 
+## Соответствие заданию
+
+| Требование                                   | Где реализовано                                                                                                                         |
+|----------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------|
+| Таблицы `payments` и `outbox`, миграции      | [`db/models.py`](src/app/db/models.py), [`migrations/versions/0001_…`](migrations/versions/0001_create_payments_and_outbox.py)          |
+| `POST` и `GET` платежа, `X-API-Key`          | [`api/payments.py`](src/app/api/payments.py), [`api/deps.py`](src/app/api/deps.py)                                                      |
+| Событие в очередь `payments.new`             | [`messaging/topology.py`](src/app/messaging/topology.py)                                                                                |
+| Один consumer: шлюз, статус, webhook, повторы | [`consumer/handler.py`](src/app/consumer/handler.py), [`services/processing.py`](src/app/services/processing.py)                       |
+| Outbox pattern                               | запись — [`services/payments.py`](src/app/services/payments.py), публикация — [`outbox/relay.py`](src/app/outbox/relay.py)              |
+| Idempotency key                              | [`services/payments.py`](src/app/services/payments.py); подробности — в разделе [«Идемпотентность»](#идемпотентность)                     |
+| Retry с экспоненциальной задержкой и DLQ     | [`consumer/handler.py`](src/app/consumer/handler.py), [`messaging/topology.py`](src/app/messaging/topology.py); раздел [«Повторы»](#повторы) |
+| Docker                                       | [`docker-compose.yml`](docker-compose.yml): `postgres`, `rabbitmq`, `api`, `consumer` и три вспомогательных сервиса                     |
+
+Два места, которые задание допускает читать по-разному:
+
+- **«3 попытки» — всего три обработки:** первая и два повтора с задержками
+  2 с и 4 с. После третьей неудачи сообщение уходит в DLQ.
+- **Отказ шлюза (10%) — не ошибка, а итог платежа:** статус `failed` и
+  webhook клиенту, без повторов. Повторяется сбой обработки — недоставленный
+  webhook или ошибка БД; шлюз при повторе второй раз не вызывается.
+
 ## Запуск
 
 Нужен Docker Compose 2.24 или новее. Ручных шагов нет: миграции применяет
@@ -23,10 +44,14 @@ docker compose up --build
 
 Сервис готов, когда в логе появились строки запуска `api`.
 
-| Что         | Адрес                    | Переменная порта   |
-|-------------|--------------------------|--------------------|
-| API         | `http://localhost:8000`  | `API_PORT`         |
-| UI RabbitMQ | `http://localhost:15672` | `RABBITMQ_UI_PORT` |
+| Что         | Адрес                        | Переменная порта   |
+|-------------|------------------------------|--------------------|
+| API         | `http://localhost:8000`      | `API_PORT`         |
+| Swagger UI  | `http://localhost:8000/docs` | `API_PORT`         |
+| UI RabbitMQ | `http://localhost:15672`     | `RABBITMQ_UI_PORT` |
+
+Swagger UI открывается без ключа, запросы из него — с ключом, введённым через
+кнопку Authorize.
 
 Логин и пароль UI RabbitMQ — `payments` / `payments`. Ключ API — `dev-api-key`,
 меняется переменной `API_KEY`. Переменные задаются в окружении или в файле
@@ -164,21 +189,62 @@ docker compose stop rabbitmq
 
 ### Схема потока
 
+```mermaid
+flowchart TB
+    client([Клиент]) -- "POST /api/v1/payments" --> api[api]
+    api -- "INSERT payments + outbox,<br/>один commit" --> db[(PostgreSQL)]
+    db -- "SELECT … FOR UPDATE<br/>SKIP LOCKED" --> relay[outbox-relay]
+    relay -- "publish,<br/>confirm брокера" --> ex{{exchange<br/>payments}}
+    ex --> new[[payments.new]]
+    new --> consumer[consumer]
+    consumer -- "webhook" --> hook([webhook_url клиента])
+
+    consumer -- "сбой, попытка < 3:<br/>копия с x-attempt + 1" --> rex{{exchange<br/>payments.retry}}
+    rex --> retry[[payments.retry.2000<br/>payments.retry.4000]]
+    retry -- "TTL истёк" --> ex
+
+    new -- "reject без requeue:<br/>попытка 3 или нечитаемое" --> dlx{{exchange<br/>payments.dlx}}
+    dlx --> dlq[[payments.dlq]]
 ```
-POST /api/v1/payments
-   │  одна транзакция: INSERT payments + INSERT outbox
-   ▼
- 202 Accepted
-                 outbox-relay: SELECT … FOR UPDATE SKIP LOCKED
-                    │  publish с подтверждением брокера
-                    ▼
-        exchange payments ──► queue payments.new ──► consumer
-                                   ▲                    │ сбой, попытка < 3
-                                   │ TTL истёк          ▼
-                       queue payments.retry.<мс> ◄── exchange payments.retry
-                                                        │ сбой, попытка = 3
-                                                        ▼
-                              exchange payments.dlx ──► queue payments.dlq
+
+### Путь одного платежа
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Клиент
+    participant A as api
+    participant DB as PostgreSQL
+    participant R as outbox-relay
+    participant MQ as RabbitMQ
+    participant W as consumer
+    participant G as Шлюз (эмулятор)
+
+    C->>A: POST /payments, Idempotency-Key
+    A->>DB: INSERT payments + outbox, один commit
+    A-->>C: 202 {payment_id, status: pending}
+    R->>DB: SELECT неопубликованные FOR UPDATE SKIP LOCKED
+    R->>MQ: publish в payments.new, ждёт confirm
+    R->>DB: published_at, commit
+    MQ->>W: payment.created
+    Note over W,DB: Транзакция 1: шлюз вызывается, только если статус pending
+    W->>DB: SELECT … FOR UPDATE
+    W->>G: charge, 2–5 с
+    G-->>W: успех 90% / отказ 10%
+    W->>DB: status, processed_at, commit
+    Note over W,DB: Транзакция 2: webhook, только если ещё не доставлен
+    W->>DB: SELECT … FOR UPDATE
+    W->>C: POST webhook_url
+    alt ответ 2xx
+        W->>DB: webhook_delivered_at, commit
+        W->>MQ: ack
+    else сбой, попытка < 3
+        W->>MQ: копия в payments.retry.<мс>, x-attempt + 1
+        W->>MQ: ack оригинала
+        MQ->>W: через 2 или 4 с — снова payment.created
+    else сбой, попытка 3
+        W->>MQ: reject — сообщение уходит в payments.dlq
+    end
 ```
 
 ### Outbox
