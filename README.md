@@ -1,176 +1,168 @@
 # Асинхронный сервис процессинга платежей
 
-## Что это
+HTTP API принимает платёж и сразу отвечает `202 Accepted`. Дальше платёж
+обрабатывается в фоне: consumer RabbitMQ вызывает эмулятор платёжного шлюза
+(пауза 2–5 с, 90% успеха), сохраняет статус `succeeded` или `failed` и
+отправляет webhook на `webhook_url` клиента. Сбой обработки повторяется с
+задержкой, после трёх неудачных попыток сообщение уходит в Dead Letter Queue.
 
-HTTP API принимает платёж и сразу отвечает `202 Accepted`. Платёж обрабатывается
-в фоне: consumer RabbitMQ эмулирует платёжный шлюз (пауза 2–5 с, 90% успеха),
-сохраняет итоговый статус `succeeded` или `failed` и отправляет webhook на
-`webhook_url` клиента. Сбои обработки повторяются с задержкой, после трёх
-неудачных доставок сообщение попадает в Dead Letter Queue.
+Платёж не теряется, даже если RabbitMQ недоступен в момент запроса: API пишет
+событие в таблицу outbox, а в брокер его переносит отдельный процесс.
 
 Стек: FastAPI, Pydantic v2, SQLAlchemy 2.0 (async), PostgreSQL 17, RabbitMQ 4.4
-через FastStream, Alembic, Docker Compose. События передаются из API в брокер
-через паттерн Outbox, поэтому платёж не теряется, если RabbitMQ недоступен в
-момент запроса.
+через FastStream, Alembic, Docker Compose.
 
 ## Запуск
 
-Нужны Docker и Docker Compose версии не ниже 2.24 (в ней появился
-необязательный `env_file` с `required: false`). Никаких ручных шагов
-(миграции, очереди, `.env`) не требуется:
+Нужен Docker Compose 2.24 или новее. Ручных шагов нет: миграции применяет
+сервис `migrate`, очереди объявляют `outbox-relay` и `consumer`.
 
 ```bash
 docker compose up --build
 ```
 
-Миграции применяет сервис `migrate`, очереди и обменники объявляют сами
-`outbox-relay` и `consumer`. Когда в логе появятся строки запуска `api`, сервис
-готов. API слушает `http://localhost:8000`, UI RabbitMQ — `http://localhost:15672`
-(логин и пароль `payments`).
+Сервис готов, когда в логе появились строки запуска `api`.
+
+| Что         | Адрес                    | Переменная порта   |
+|-------------|--------------------------|--------------------|
+| API         | `http://localhost:8000`  | `API_PORT`         |
+| UI RabbitMQ | `http://localhost:15672` | `RABBITMQ_UI_PORT` |
+
+Логин и пароль UI RabbitMQ — `payments` / `payments`. Ключ API — `dev-api-key`,
+меняется переменной `API_KEY`. Переменные задаются в окружении или в файле
+`.env`; образец со всеми настройками и значениями по умолчанию —
+`.env.example`.
 
 Остановка с удалением данных: `docker compose down -v`.
 
-### Другой порт
+## API
 
-Если порт 8000 занят, задайте `API_PORT` (аналогично `RABBITMQ_UI_PORT` для UI
-RabbitMQ):
+Все эндпоинты находятся под `/api/v1` и требуют заголовок `X-API-Key`; без него
+или с неверным ключом — `401`.
 
-```bash
-API_PORT=18000 docker compose up --build
-```
+### `POST /api/v1/payments`
 
-Дальше во всех примерах замените `localhost:8000` на `localhost:18000`. Те же
-переменные можно положить в файл `.env` (образец — `.env.example`); без него
-используются значения по умолчанию.
+Заголовок `Idempotency-Key` обязателен, 1–255 символов. Тело:
 
-Ключ API по умолчанию — `dev-api-key`, меняется переменной `API_KEY`.
+| Поле          | Обязательно | Правило                                       |
+|---------------|-------------|-----------------------------------------------|
+| `amount`      | да          | больше нуля, не более двух знаков после точки |
+| `currency`    | да          | `RUB`, `USD` или `EUR`                        |
+| `webhook_url` | да          | http или https URL                            |
+| `description` | нет         | до 500 символов                               |
+| `metadata`    | нет         | JSON-объект                                   |
 
-## Примеры
+Ответы:
 
-Все эндпоинты находятся под `/api/v1` и требуют заголовок `X-API-Key`.
-`POST /api/v1/payments` дополнительно требует `Idempotency-Key` (1–255
-символов). В примерах `webhook_url` указывает на сервис `webhook-mock` из
-compose; адрес `http://webhook-mock:8080/ok` виден только внутри сети compose.
+- `202` — `{"payment_id": "<uuid>", "status": "pending", "created_at": "<время>"}`.
+  Повтор с тем же ключом и тем же телом возвращает тот же `payment_id` и
+  текущий статус платежа. Тела сравниваются после нормализации: `"100.5"` и
+  `"100.50"`, как и другой порядок ключей, — один и тот же запрос.
+- `409` — ключ уже использован с другим телом.
+- `422` — невалидное тело или нет `Idempotency-Key`.
 
-### Создание платежа
+### `GET /api/v1/payments/{payment_id}`
 
-```bash
-curl -i -X POST http://localhost:8000/api/v1/payments \
-  -H 'X-API-Key: dev-api-key' \
-  -H 'Idempotency-Key: demo-1' \
-  -H 'Content-Type: application/json' \
-  -d '{"amount": "100.50", "currency": "RUB", "description": "Заказ 1", "metadata": {"order_id": 1}, "webhook_url": "http://webhook-mock:8080/ok"}'
-```
+`200` с полями `payment_id`, `amount` (строкой, например `"100.50"`),
+`currency`, `description`, `metadata`, `status`, `idempotency_key`,
+`webhook_url`, `created_at`, `processed_at`, `webhook_delivered_at`.
+`404` — платежа нет, `422` — `payment_id` не UUID.
 
-Ответ `202 Accepted`:
+### Webhook
+
+После обработки сервис отправляет `POST` с JSON на `webhook_url`:
 
 ```json
-{"payment_id": "<uuid>", "status": "pending", "created_at": "<время>"}
+{
+  "payment_id": "<uuid>",
+  "status": "succeeded",
+  "amount": "100.50",
+  "currency": "RUB",
+  "description": "Заказ 1",
+  "metadata": {"order_id": 1},
+  "processed_at": "<время>"
+}
 ```
 
-Правила тела: `amount` больше нуля, не более двух знаков после запятой;
-`currency` — `RUB`, `USD` или `EUR`; `description` до 500 символов
-(необязательно); `metadata` — JSON-объект (необязательно); `webhook_url` —
-http/https URL. Невалидное тело или отсутствующий `Idempotency-Key` дают `422`,
-неверный или отсутствующий `X-API-Key` — `401`.
+Доставленным считается любой ответ `2xx`, редиректы не выполняются.
 
-### Повтор с тем же ключом
+## Пример
 
-Тот же запрос с тем же `Idempotency-Key` и тем же телом не создаёт второй
-платёж: возвращается `202` с тем же `payment_id` и текущим статусом платежа
-(к этому моменту он уже может быть `succeeded` или `failed`).
+`webhook_url` в примерах указывает на сервис `webhook-mock` из compose: `/ok`
+отвечает 200, `/fail` — всегда 500. Адрес `webhook-mock:8080` виден только
+внутри сети compose. Если API запущен на другом порту, поправьте `API`.
 
 ```bash
-curl -i -X POST http://localhost:8000/api/v1/payments \
-  -H 'X-API-Key: dev-api-key' \
-  -H 'Idempotency-Key: demo-1' \
-  -H 'Content-Type: application/json' \
-  -d '{"amount": "100.50", "currency": "RUB", "description": "Заказ 1", "metadata": {"order_id": 1}, "webhook_url": "http://webhook-mock:8080/ok"}'
+API=http://localhost:8000/api/v1
+AUTH='X-API-Key: dev-api-key'
+JSON='Content-Type: application/json'
+BODY='{"amount": "100.50", "currency": "RUB", "description": "Заказ 1", "metadata": {"order_id": 1}, "webhook_url": "http://webhook-mock:8080/ok"}'
 ```
 
-Сравнение идёт по нормализованному телу: `"100.5"` и `"100.50"`, как и другой
-порядок ключей JSON, считаются одним и тем же запросом.
-
-### Конфликт: тот же ключ, другое тело
+Создать платёж и запомнить его id:
 
 ```bash
-curl -i -X POST http://localhost:8000/api/v1/payments \
-  -H 'X-API-Key: dev-api-key' \
-  -H 'Idempotency-Key: demo-1' \
-  -H 'Content-Type: application/json' \
+RESPONSE=$(curl -s -X POST "$API/payments" -H "$AUTH" -H "$JSON" -H 'Idempotency-Key: demo-1' -d "$BODY")
+echo "$RESPONSE"
+PAYMENT_ID=$(echo "$RESPONSE" | sed -E 's/.*"payment_id":"([^"]+)".*/\1/')
+```
+
+Повтор с тем же ключом вернёт `202` и тот же `payment_id`, а с другим телом —
+`409`:
+
+```bash
+curl -i -X POST "$API/payments" -H "$AUTH" -H "$JSON" -H 'Idempotency-Key: demo-1' -d "$BODY"
+curl -i -X POST "$API/payments" -H "$AUTH" -H "$JSON" -H 'Idempotency-Key: demo-1' \
   -d '{"amount": "999.00", "currency": "RUB", "webhook_url": "http://webhook-mock:8080/ok"}'
 ```
 
-Ответ `409 Conflict`.
-
-### Получение платежа
-
-Подставьте `payment_id` из ответа на создание (или возьмите его из ключа
-`demo-1` командой ниже):
+Через несколько секунд платёж получает итоговый статус (`failed` — в 10% случаев),
+заполняются `processed_at` и `webhook_delivered_at`, а полученный webhook виден
+в логе `webhook-mock`:
 
 ```bash
-PAYMENT_ID=$(curl -s -X POST http://localhost:8000/api/v1/payments \
-  -H 'X-API-Key: dev-api-key' \
-  -H 'Idempotency-Key: demo-1' \
-  -H 'Content-Type: application/json' \
-  -d '{"amount": "100.50", "currency": "RUB", "description": "Заказ 1", "metadata": {"order_id": 1}, "webhook_url": "http://webhook-mock:8080/ok"}' \
-  | sed -E 's/.*"payment_id":"([^"]+)".*/\1/')
-echo "$PAYMENT_ID"
-
-curl -i http://localhost:8000/api/v1/payments/$PAYMENT_ID -H 'X-API-Key: dev-api-key'
-```
-
-Ответ `200` содержит поля `payment_id`, `amount` (строкой, например `"100.50"`),
-`currency`, `description`, `metadata`, `status`, `idempotency_key`,
-`webhook_url`, `created_at`, `processed_at`, `webhook_delivered_at`. Через
-несколько секунд `status` меняется на `succeeded` (или `failed` — шлюз-эмулятор
-отказывает в 10% случаев), а `processed_at` и `webhook_delivered_at`
-заполняются. Платежа нет — `404`; `payment_id` не UUID — `422`.
-
-Тело webhook'а, которое получил `webhook-mock`, видно в его логе:
-
-```bash
+curl -s "$API/payments/$PAYMENT_ID" -H "$AUTH"
 docker compose logs webhook-mock
 ```
 
-## Повторы и DLQ
+### Повторы и DLQ
 
-`webhook-mock` отвечает на `POST /ok` кодом 200, а на `POST /fail` — всегда 500.
-Чтобы увидеть повторы, создайте платёж с `webhook_url`
-`http://webhook-mock:8080/fail`:
+Платёж с `webhook_url`, который всегда отвечает 500:
 
 ```bash
-curl -i -X POST http://localhost:8000/api/v1/payments \
-  -H 'X-API-Key: dev-api-key' \
-  -H 'Idempotency-Key: demo-fail-1' \
-  -H 'Content-Type: application/json' \
+curl -i -X POST "$API/payments" -H "$AUTH" -H "$JSON" -H 'Idempotency-Key: demo-fail-1' \
   -d '{"amount": "10.00", "currency": "USD", "webhook_url": "http://webhook-mock:8080/fail"}'
 ```
 
-Через ~10–15 секунд (одна пауза шлюза 2–5 с в первой попытке, затем задержки 2 с и 4 с):
+Через 10–15 секунд (пауза шлюза в первой попытке, затем задержки 2 с и 4 с):
 
-- `docker compose logs webhook-mock` показывает три запроса на `/fail`;
-- `docker compose logs consumer` показывает записи о сбоях попыток 1 и 2 с
-  исходом повтора и попытки 3 с отправкой в DLQ;
-- в UI RabbitMQ (`http://localhost:15672`, `payments` / `payments`), вкладка
-  Queues, в очереди `payments.dlq` одно сообщение; через `Get messages` видно
-  заголовок `x-attempt: 3`. То же из консоли:
+- в логе `webhook-mock` три запроса на `/fail`;
+- в логе `consumer` сбои попыток 1 и 2 с исходом `retry` и попытки 3 с
+  исходом `dead`;
+- в очереди `payments.dlq` одно сообщение с заголовком `x-attempt: 3`. Его
+  видно в UI RabbitMQ (Queues → `payments.dlq` → Get messages) или так:
 
   ```bash
   curl -s -u payments:payments -X POST http://localhost:15672/api/queues/%2F/payments.dlq/get \
-    -H 'content-type: application/json' \
-    -d '{"count": 1, "ackmode": "ack_requeue_true", "encoding": "auto"}'
+    -H "$JSON" -d '{"count": 1, "ackmode": "ack_requeue_true", "encoding": "auto"}'
   ```
 
-Платёж при этом уже имеет итоговый статус (шлюз вызывается один раз), а
-`webhook_delivered_at` у него пуст: webhook так и не доставлен.
+Итоговый статус у платежа при этом есть (шлюз вызывается один раз), а
+`webhook_delivered_at` пуст.
 
-Чтобы увидеть, что платежи принимаются при недоступном брокере, остановите
-RabbitMQ: `docker compose stop rabbitmq`, создайте платёж (ответ `202`), затем
-`docker compose start rabbitmq` — `outbox-relay` дождётся брокера, опубликует
+### Недоступный брокер
+
+```bash
+docker compose stop rabbitmq
+```
+
+Платёж, созданный в это время, принимается с ответом `202`. После
+`docker compose start rabbitmq` `outbox-relay` дождётся брокера и опубликует
 событие, и платёж будет обработан.
 
-## Схема потока
+## Устройство
+
+### Схема потока
 
 ```
 POST /api/v1/payments
@@ -189,55 +181,69 @@ POST /api/v1/payments
                               exchange payments.dlx ──► queue payments.dlq
 ```
 
-## Устройство
+### Outbox
 
-**Outbox.** API записывает платёж и событие `payment.created` в таблицу `outbox`
-одной транзакцией и с RabbitMQ не общается вовсе. Отдельный процесс
-`outbox-relay` в цикле выбирает до 50 неопубликованных событий в порядке
-создания (`SELECT … FOR UPDATE SKIP LOCKED`, поэтому можно запускать несколько
-экземпляров), публикует их в exchange `payments` с подтверждением брокера
-(персистентное сообщение, `mandatory`, таймаут ожидания) и помечает
-`published_at`. При ошибке публикации уже подтверждённые события пакета
-фиксируются, остальные остаются в таблице, а relay повторяет попытку с
-нарастающей паузой (до 30 с) без ограничения числа попыток. Все публикации в
-RabbitMQ (relay и повторы consumer) идут через один класс `ReliablePublisher`.
+API записывает платёж и событие `payment.created` одной транзакцией и с
+RabbitMQ не общается. Процесс `outbox-relay` в цикле:
 
-**Топология RabbitMQ.** Три direct-обменника (`payments`, `payments.retry`,
-`payments.dlx`) и durable-очереди: основная `payments.new`; по очереди задержки
-на каждый уровень повтора, `payments.retry.2000` и `payments.retry.4000`, с TTL
-в имени очереди и возвратом в `payments.new` по истечении TTL; `payments.dlq`
-без потребителя. Номер попытки хранится в заголовке `x-attempt`. Сообщение,
-отклонённое из `payments.new` (`reject` без requeue), RabbitMQ сам перекладывает
-в `payments.dlq`. Топологию объявляют при старте и `outbox-relay`, и `consumer`,
-поэтому порядок запуска не важен.
+1. выбирает до 50 неопубликованных событий в порядке создания
+   (`SELECT … FOR UPDATE SKIP LOCKED`, поэтому экземпляров может быть
+   несколько);
+2. публикует их в exchange `payments`: сообщение персистентное, `mandatory`,
+   с ожиданием подтверждения брокера и таймаутом;
+3. помечает `published_at`.
 
-**Идемпотентность.** На уровне API — уникальный индекс по `idempotency_key` и
-`INSERT … ON CONFLICT DO NOTHING`: два одновременных запроса с одним ключом
-создают один платёж; для сравнения тел хранится SHA-256 нормализованного
-запроса (`request_hash`). На уровне consumer — каждая доставка берёт строку
-платежа через `SELECT … FOR UPDATE`: шлюз вызывается только для платежа в статусе
-`pending`, webhook отправляется только если `webhook_delivered_at` пуст. Дубль
-сообщения (в том числе обрабатываемый одновременно) не меняет итоговый статус и
-не вызывает шлюз и webhook повторно. Итоговый статус и доставка webhook
-сохраняются в двух отдельных транзакциях, поэтому при сбое webhook повтор
-шлюз заново не вызывает.
+При ошибке публикации подтверждённые события пакета фиксируются, остальные
+остаются в таблице. Relay повторяет попытку с нарастающей паузой до 30 с без
+ограничения числа попыток. Все публикации в RabbitMQ (relay и повторы
+consumer) идут через `ReliablePublisher`.
 
-## Зачем в compose сервисы сверх четырёх из задания
+### Повторы
 
-Кроме `postgres`, `rabbitmq`, `api` и `consumer` в compose есть:
+Три direct-обменника: `payments`, `payments.retry`, `payments.dlx`. Номер
+попытки хранится в заголовке `x-attempt`.
 
-- `outbox-relay` — публикатор outbox. Он вынесен в отдельный процесс, чтобы
-  публикация не зависела от рестартов и числа воркеров API и чтобы паттерн
-  Outbox был виден и проверяем отдельно. Это тот же образ с другой командой
-  запуска.
-- `migrate` — разовый запуск `alembic upgrade head`; остальные прикладные
-  сервисы ждут его успешного завершения. Так `docker compose up` работает без
-  ручных шагов.
-- `webhook-mock` — вспомогательный приёмник webhook'ов (`devtools/webhook_mock.py`):
-  `/ok` отвечает 200, `/fail` всегда 500. Нужен, чтобы примеры работали без
-  внешних сервисов, а повторы и DLQ можно было воспроизвести. Не часть сервиса.
+- `payments.new` — основная очередь consumer.
+- `payments.retry.2000` и `payments.retry.4000` — очереди задержки без
+  потребителей. По истечении TTL сообщение возвращается в `payments.new`.
+  TTL очереди нельзя изменить после создания, поэтому задержка входит в имя.
+- `payments.dlq` — очередь без потребителя. Сообщение, отклонённое из
+  `payments.new` (`reject` без requeue), RabbitMQ перекладывает сюда сам.
 
-`api` намеренно не зависит от `rabbitmq`.
+Топологию при старте объявляют и `outbox-relay`, и `consumer`, поэтому порядок
+запуска не важен.
+
+### Идемпотентность
+
+- **API.** Уникальный индекс по `idempotency_key` и
+  `INSERT … ON CONFLICT DO NOTHING`: два одновременных запроса с одним ключом
+  создают один платёж. Для сравнения тел хранится SHA-256 нормализованного
+  запроса (`request_hash`).
+- **Consumer.** Каждая доставка берёт строку платежа через
+  `SELECT … FOR UPDATE`. Шлюз вызывается только для платежа в статусе
+  `pending`, webhook отправляется, только если `webhook_delivered_at` пуст.
+  Дубль сообщения, в том числе обрабатываемый одновременно, не вызывает шлюз и
+  webhook повторно.
+- Статус и отметка о доставке webhook сохраняются в двух отдельных
+  транзакциях, поэтому повтор после сбоя webhook не вызывает шлюз заново.
+
+### Сервисы compose
+
+| Сервис         | Назначение                                                    |
+|----------------|---------------------------------------------------------------|
+| `postgres`     | база платежей и outbox                                        |
+| `rabbitmq`     | брокер                                                        |
+| `api`          | HTTP API; от `rabbitmq` намеренно не зависит                  |
+| `consumer`     | обработка платежей, повторы, DLQ                              |
+| `outbox-relay` | перенос событий из outbox в RabbitMQ                          |
+| `migrate`      | разовый `alembic upgrade head`, остальные ждут его завершения |
+| `webhook-mock` | приёмник webhook'ов для примеров, не часть сервиса            |
+
+Сверх четырёх сервисов из задания добавлены три. `outbox-relay` вынесен в
+отдельный процесс (тот же образ, другая команда), чтобы публикация не зависела
+от рестартов и числа воркеров API. `migrate` позволяет поднять всё одной
+командой. `webhook-mock` (`devtools/webhook_mock.py`) нужен, чтобы примеры,
+повторы и DLQ воспроизводились без внешних сервисов.
 
 ## Гарантии и их границы
 
@@ -273,20 +279,19 @@ RabbitMQ (relay и повторы consumer) идут через один кла�
   остаются пустыми, а не вызывают ошибку объявления.
 - Опубликованные строки outbox не очищаются; `API_KEY` один на весь сервис.
 
-## Тесты и линтеры
+## Разработка
 
-Нужен Python 3.14 и [uv](https://docs.astral.sh/uv/). Тесты используют настоящие
-PostgreSQL и RabbitMQ в контейнерах (testcontainers), поэтому **Docker должен
-быть запущен**.
+Нужны Python 3.14, [uv](https://docs.astral.sh/uv/) и запущенный Docker: тесты
+поднимают настоящие PostgreSQL и RabbitMQ через testcontainers.
 
 ```bash
 uv sync
-uv run pytest -v
+uv run pytest
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src
 ```
 
 Тесты покрывают идемпотентность API, outbox relay (в том числе `SKIP LOCKED` и
-сбои публикации), повторы и DLQ, обработку дублей и один сквозной сценарий
+сбои публикации), повторы и DLQ, обработку дублей и сквозной сценарий
 API → relay → consumer → webhook.
