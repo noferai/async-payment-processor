@@ -1,7 +1,7 @@
 import math
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
 from pydantic import BaseModel, Field, HttpUrl, field_validator
@@ -39,11 +39,27 @@ def _unstorable_reason(value: Any) -> str | None:
 
 
 class PaymentCreate(BaseModel):
-    amount: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
-    currency: Currency
-    description: str | None = Field(default=None, max_length=500)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    webhook_url: HttpUrl
+    amount: Decimal = Field(
+        gt=0,
+        max_digits=18,
+        decimal_places=2,
+        description="Сумма: больше нуля, не более двух знаков после точки и 18 цифр всего. "
+        "Строка точнее числа: число JSON клиент может округлить как float.",
+        examples=["100.50"],
+    )
+    currency: Currency = Field(description="Валюта платежа.", examples=["RUB"])
+    description: str | None = Field(
+        default=None, max_length=500, description="Описание платежа, до 500 символов.", examples=["Заказ 1"]
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Произвольный JSON-объект клиента; возвращается в ответах и в webhook.",
+        examples=[{"order_id": 1}],
+    )
+    webhook_url: HttpUrl = Field(
+        description="http или https адрес, на который придёт webhook с итогом платежа.",
+        examples=["https://shop.example/webhooks/payments"],
+    )
 
     @field_validator("description", "metadata")
     @classmethod
@@ -54,10 +70,22 @@ class PaymentCreate(BaseModel):
         return value
 
 
+# Описания общих полей: одно поле в ответах API и в webhook должно описываться одинаково
+PaymentId = Annotated[UUID, Field(description="Идентификатор платежа.")]
+Status = Annotated[PaymentStatus, Field(description="`pending` до обработки, затем `succeeded` или `failed`.")]
+CurrencyField = Annotated[Currency, Field(description="Валюта платежа.")]
+DescriptionField = Annotated[str | None, Field(description="Описание платежа из запроса.")]
+MetadataField = Annotated[dict[str, Any], Field(description="JSON-объект клиента из запроса.")]
+
+
+class ErrorResponse(BaseModel):
+    detail: str = Field(description="Текст ошибки.")
+
+
 class PaymentAccepted(BaseModel):
-    payment_id: UUID
-    status: PaymentStatus
-    created_at: datetime
+    payment_id: PaymentId
+    status: Status
+    created_at: datetime = Field(description="Время приёма платежа.")
 
     @classmethod
     def from_payment(cls, payment: Payment) -> PaymentAccepted:
@@ -65,17 +93,19 @@ class PaymentAccepted(BaseModel):
 
 
 class PaymentDetail(BaseModel):
-    payment_id: UUID
-    amount: Decimal
-    currency: Currency
-    description: str | None
-    metadata: dict[str, Any]
-    status: PaymentStatus
-    idempotency_key: str
-    webhook_url: str
-    created_at: datetime
-    processed_at: datetime | None
-    webhook_delivered_at: datetime | None
+    payment_id: PaymentId
+    amount: Decimal = Field(description="Сумма строкой, всегда с двумя знаками после точки.")
+    currency: CurrencyField
+    description: DescriptionField
+    metadata: MetadataField
+    status: Status
+    idempotency_key: str = Field(description="Значение заголовка Idempotency-Key, с которым создан платёж.")
+    webhook_url: str = Field(description="Адрес webhook из запроса.")
+    created_at: datetime = Field(description="Время приёма платежа.")
+    processed_at: datetime | None = Field(description="Когда сохранён итог платежа; null, пока платёж в обработке.")
+    webhook_delivered_at: datetime | None = Field(
+        description="Когда webhook принят ответом 2xx; null, пока не доставлен."
+    )
 
     @classmethod
     def from_payment(cls, payment: Payment) -> PaymentDetail:
@@ -93,3 +123,15 @@ class PaymentDetail(BaseModel):
             processed_at=payment.processed_at,
             webhook_delivered_at=payment.webhook_delivered_at,
         )
+
+
+class WebhookPayload(BaseModel):
+    """Тело webhook для документации API; само тело собирает build_webhook_payload."""
+
+    payment_id: PaymentId
+    status: Status
+    amount: str = Field(description="Сумма строкой, всегда с двумя знаками после точки.", examples=["100.50"])
+    currency: CurrencyField
+    description: DescriptionField
+    metadata: MetadataField
+    processed_at: datetime = Field(description="Когда сохранён итог платежа.")
