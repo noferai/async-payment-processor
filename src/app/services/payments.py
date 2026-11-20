@@ -1,5 +1,3 @@
-"""Бизнес-логика платежей: идемпотентное создание и чтение."""
-
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -12,6 +10,9 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Currency, OutboxEvent, Payment
+from app.messaging.topology import NEW_QUEUE
+
+PAYMENT_CREATED = "payment.created"
 
 
 class IdempotencyConflict(Exception):
@@ -20,8 +21,6 @@ class IdempotencyConflict(Exception):
 
 @dataclass(frozen=True, slots=True)
 class NewPayment:
-    """Данные нового платежа, уже провалидированные точкой входа."""
-
     amount: Decimal
     currency: Currency
     webhook_url: str
@@ -29,9 +28,14 @@ class NewPayment:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+def format_amount(amount: Decimal) -> str:
+    """Всегда два знака после точки: "100.5" и "100.50" — одна и та же сумма."""
+    return format(amount.quantize(Decimal("0.01")), "f")
+
+
 def compute_request_hash(data: NewPayment) -> str:
     canonical = {
-        "amount": format(data.amount.quantize(Decimal("0.01")), "f"),
+        "amount": format_amount(data.amount),
         "currency": data.currency.value,
         "description": data.description,
         "metadata": data.metadata,
@@ -42,12 +46,15 @@ def compute_request_hash(data: NewPayment) -> str:
 
 
 async def create_payment(session: AsyncSession, data: NewPayment, idempotency_key: str) -> Payment:
-    """Создаёт платёж и событие outbox в одной транзакции (сам коммитит)."""
+    """Создаёт платёж и событие outbox одной транзакцией и сам её коммитит.
+
+    Повтор с тем же ключом и телом возвращает уже созданный платёж.
+    """
     request_hash = compute_request_hash(data)
     stmt = (
         insert(Payment)
         .values(
-            amount=data.amount.quantize(Decimal("0.01")),
+            amount=data.amount,
             currency=data.currency,
             description=data.description,
             metadata_=data.metadata,
@@ -63,15 +70,15 @@ async def create_payment(session: AsyncSession, data: NewPayment, idempotency_ke
         session.add(
             OutboxEvent(
                 aggregate_id=payment.id,
-                event_type="payment.created",
-                routing_key="payments.new",
+                event_type=PAYMENT_CREATED,
+                routing_key=NEW_QUEUE,
                 payload={"payment_id": str(payment.id)},
             )
         )
         await session.commit()
         return payment
 
-    # Отдельный SELECT: параллельная транзакция к этому моменту уже закоммитила строку.
+    # Отдельный SELECT: параллельная транзакция к этому моменту уже закоммитила строку
     existing = (await session.scalars(sa.select(Payment).where(Payment.idempotency_key == idempotency_key))).one()
     if existing.request_hash != request_hash:
         raise IdempotencyConflict("Idempotency-Key уже использован с другим телом запроса")

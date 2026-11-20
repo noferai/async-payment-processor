@@ -1,5 +1,3 @@
-"""Декларативная база SQLAlchemy."""
-
 from sqlalchemy.orm import DeclarativeBase
 
 

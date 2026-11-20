@@ -1,5 +1,3 @@
-"""Обработчик сообщений payments.new: обработка платежа и завершение по исходу."""
-
 import json
 import logging
 from collections.abc import Mapping, Sequence
@@ -30,7 +28,7 @@ def parse_payment_id(body: bytes) -> UUID:
 
 
 class PaymentMessageHandler:
-    """Разделяет обработку и завершение: сбой подтверждения не считается сбоем обработки."""
+    """Обработка и подтверждение разделены: сбой ack не считается сбоем обработки."""
 
     def __init__(
         self,
@@ -69,19 +67,14 @@ class PaymentMessageHandler:
         except PaymentNotFound:
             logger.exception("payment %s not found, sending message to DLQ", payment_id)
             return Outcome.DEAD, attempt
-        except Exception as exc:
+        except WebhookDeliveryError as exc:
+            # Ожидаемый сбой: текст ошибки полон, трассировка лишь засорит лог
             outcome = failure_outcome(attempt, self._max_attempts)
-            if isinstance(exc, WebhookDeliveryError):
-                # Ожидаемый сбой: текст ошибки полон, трассировка лишь засорит лог
-                logger.warning(
-                    "payment %s attempt %d failed: %s, outcome %s",
-                    payment_id,
-                    attempt,
-                    exc,
-                    outcome,
-                )
-            else:
-                logger.exception("payment %s attempt %d failed, outcome %s", payment_id, attempt, outcome)
+            logger.warning("payment %s attempt %d failed: %s, outcome %s", payment_id, attempt, exc, outcome)
+            return outcome, attempt
+        except Exception:
+            outcome = failure_outcome(attempt, self._max_attempts)
+            logger.exception("payment %s attempt %d failed, outcome %s", payment_id, attempt, outcome)
             return outcome, attempt
         return Outcome.DONE, attempt
 

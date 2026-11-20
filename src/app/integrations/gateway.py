@@ -1,5 +1,3 @@
-"""Платёжный шлюз: протокол и эмулятор."""
-
 import asyncio
 import random
 from typing import Protocol

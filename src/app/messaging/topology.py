@@ -1,5 +1,3 @@
-"""Топология RabbitMQ: exchange, основная очередь, очереди задержки и DLQ."""
-
 from collections.abc import Sequence
 
 from faststream.rabbit import ExchangeType, RabbitBroker, RabbitExchange, RabbitQueue
@@ -32,7 +30,6 @@ def dlx_exchange() -> RabbitExchange:
 
 
 def new_queue() -> RabbitQueue:
-    # Отклонённые сообщения уходят в DLQ
     return RabbitQueue(
         NEW_QUEUE,
         durable=True,
@@ -54,7 +51,7 @@ def retry_queue_name(delay_ms: int) -> str:
 
 
 def retry_queue(delay_ms: int) -> RabbitQueue:
-    # По истечении TTL сообщение возвращается в основную очередь
+    # У очереди нет потребителей: по истечении TTL сообщение возвращается в основную очередь
     name = retry_queue_name(delay_ms)
     return RabbitQueue(
         name,

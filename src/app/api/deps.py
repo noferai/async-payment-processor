@@ -1,5 +1,3 @@
-"""Зависимости FastAPI: сессия БД, проверка API-ключа."""
-
 import secrets
 from collections.abc import AsyncIterator
 from typing import Annotated

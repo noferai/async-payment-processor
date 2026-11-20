@@ -1,5 +1,3 @@
-"""Схемы запросов и ответов HTTP API."""
-
 import math
 from datetime import datetime
 from decimal import Decimal

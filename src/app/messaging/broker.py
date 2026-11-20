@@ -1,5 +1,3 @@
-"""Создание брокера RabbitMQ."""
-
 from faststream.rabbit import Channel, RabbitBroker
 
 from app.config import Settings

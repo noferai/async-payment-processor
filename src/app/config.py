@@ -1,5 +1,3 @@
-"""Настройки сервиса, читаются из переменных окружения."""
-
 from functools import lru_cache
 
 from pydantic import Field

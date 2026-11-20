@@ -1,5 +1,3 @@
-"""Фабрика FastAPI-приложения."""
-
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 

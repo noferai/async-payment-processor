@@ -1,5 +1,3 @@
-"""Логика повторов: номер попытки и исход обработки сообщения."""
-
 from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any

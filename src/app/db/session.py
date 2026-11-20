@@ -1,5 +1,3 @@
-"""Фабрики движка и сессий."""
-
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,

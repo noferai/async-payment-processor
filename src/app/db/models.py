@@ -1,5 +1,3 @@
-"""ORM-модели: платежи и outbox."""
-
 import uuid
 from datetime import datetime
 from decimal import Decimal

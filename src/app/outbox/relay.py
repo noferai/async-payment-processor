@@ -75,17 +75,16 @@ class OutboxRelay:
                 published = await self.run_once()
             except Exception:
                 logger.exception("outbox publish failed, retrying in %.2f s", backoff)
-                await self._sleep(stop, backoff)
+                await self._wait_for_stop(stop, backoff)
                 backoff = min(backoff * 2, self._max_backoff)
                 continue
             backoff = self._poll_interval
             if published:
                 logger.info("published %d outbox events", published)
             else:
-                await self._sleep(stop, self._poll_interval)
+                await self._wait_for_stop(stop, self._poll_interval)
 
     @staticmethod
-    async def _sleep(stop: asyncio.Event, seconds: float) -> None:
-        # Пауза прерывается сигналом остановки
+    async def _wait_for_stop(stop: asyncio.Event, seconds: float) -> None:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=seconds)

@@ -1,7 +1,4 @@
-"""Приложение FastStream consumer: регистрация подписчика на payments.new и сборка процесса.
-
-Запуск: `faststream run app.consumer.app:create_app --factory`.
-"""
+"""Запуск: `faststream run app.consumer.app:create_app --factory`."""
 
 import logging
 
@@ -33,7 +30,6 @@ def register_subscriber(broker: RabbitBroker, handler: PaymentMessageHandler) ->
 
 
 def create_app() -> FastStream:
-    """Корень композиции процесса consumer."""
     # Логгеры FastStream не распространяются в root, поэтому дублей нет;
     # root-обработчик выводит в stderr сообщения приложения (видны в docker logs)
     logging.basicConfig(level=logging.INFO)
